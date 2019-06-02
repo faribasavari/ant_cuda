@@ -17,6 +17,7 @@
 using namespace std;
 
 // TODO: change the 2D arrays into 1D: solution and makespan
+ //convert 2D to 1D done 
 struct ant {
 	int curJob, nextJob;
 	int visited[ntask];
