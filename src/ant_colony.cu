@@ -4,7 +4,7 @@
 #include<stdlib.h>
 #include<curand_kernel.h>
 #include<curand.h>
-#define MAX_TIME 1
+#define MAX_TIME 2
 #define MAX_ANTS 10
 #define Q 100
 #define ALPHA 2                  //we used alpha 10 beta 1 for u_c_lohi
@@ -20,8 +20,8 @@ using namespace std;
 struct ant {
 	int curJob, nextJob;
 	int visited[ntask];
-	int solution[MAX_TIME][ntask];
-	float makespan[MAX_TIME][nres];
+	int solution[ntask];
+	float makespan[nres];
 };
 struct job {
 
@@ -33,7 +33,9 @@ int NC = 0;
 job jobs[ntask];
 double F;
 float make[nres];
-ant ants[MAX_ANTS];
+
+int allsolution[MAX_TIME][ntask];
+float allmakespan[MAX_TIME][nres];
 double freeRes[nres];
 double pheromone[ntask][nres], Delta[ntask][nres], heuristic[ntask][nres], probability[ntask][nres],valid[ntask][nres];
 curandState  state[MAX_ANTS];
@@ -64,7 +66,7 @@ __global__ void initialize(float *d_pheromone, float *d_delta, float *d_heuristi
 
 }
 
-__device__ int findmax_probability(float *d_probability, ant *d_ant, job *d_job, float *d_free, int k,int nc) {
+__device__ int findmax_probability(float *d_probability, ant *d_ant, job *d_job, float *d_free, int k) {
 	int i, j = 0, maxj = 0, maxi = 0;
 	double max = d_probability[0];
 	for (i = 0; i < ntask; i++) {
@@ -77,11 +79,11 @@ __device__ int findmax_probability(float *d_probability, ant *d_ant, job *d_job,
 				}
 			}
 	}
-	d_ant[k].solution[nc][maxi] = maxj;
-	d_ant[k].makespan[nc][maxj] += d_job[maxi].res[maxj];
+	d_ant[k].solution[maxi] = maxj;
+	d_ant[k].makespan[maxj] += d_job[maxi].res[maxj];
 	for (int g = 0; g < nres; g++) {
 		d_probability[g + maxi*nres] = 0;
-		d_free[g] = d_free[g] - d_job[maxi].res[g];
+		d_free[g] = d_free[g] - d_job[maxi].res[g];          //update d_free
 
 	}
 	return maxi;
@@ -97,7 +99,7 @@ __device__ double findmax(float *a) {
 	return max;
 }
 
-__device__ int selectNextJob(float *d_probability, float *d_pheromone, float *d_delta, float *d_heuristic, job *d_job, int k, int n, float *d_free, ant *d_ant, int nc, curandState *state_d)
+__device__ int selectNextJob(float *d_probability, float *d_pheromone, float *d_delta, float *d_heuristic, job *d_job, int k, int n, float *d_free, ant *d_ant, curandState *state_d)
 {
 	int i;/// = ants[k].curJob;
 	int j, nextJob;
@@ -121,19 +123,19 @@ __device__ int selectNextJob(float *d_probability, float *d_pheromone, float *d_
 			}
 		}
 	}
-	nextJob = findmax_probability(d_probability, d_ant, d_job, d_free, k, nc);
+	nextJob = findmax_probability(d_probability, d_ant, d_job, d_free, k);
 
 	return nextJob;
 }
 
 
-__global__ void select(int nc, float *d_pheromone, float *d_delta, float *d_heuristic, job *d_job, ant *d_ant, float *d_probability, float *d_free, int n, curandState *state_d)
+__global__ void select( float *d_pheromone, float *d_delta, float *d_heuristic, job *d_job, ant *d_ant, float *d_probability, float *d_free, int n, curandState *state_d)
 {
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
 	if (id < MAX_ANTS) {
 		for (int s = 1; s<n; s++)
 		{
-			int j = selectNextJob(d_probability, d_pheromone, d_delta, d_heuristic, d_job, id, n, d_free, d_ant, nc, state_d);
+			int j = selectNextJob(d_probability, d_pheromone, d_delta, d_heuristic, d_job, id, n, d_free, d_ant,state_d);
 			//printf("j:%d\n", j);
 			d_ant[id].nextJob = j;
 			d_ant[id].visited[j] = 1;
@@ -143,7 +145,7 @@ __global__ void select(int nc, float *d_pheromone, float *d_delta, float *d_heur
 
 
 }
-__global__ void firststep(ant *d_ant, job *d_job,int nc) {
+__global__ void firststep(ant *d_ant, job *d_job) {
 	int randres, randtask;
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
 	if (id<MAX_ANTS) {
@@ -165,9 +167,9 @@ __global__ void firststep(ant *d_ant, job *d_job,int nc) {
 
 		d_ant[id].visited[randtask] = 1;
 		for (int i = 0; i<nres; i++)
-			d_ant[id].makespan[nc][i] = 0;
-		d_ant[id].makespan[nc][randres] = d_job[randtask].res[randres];
-		d_ant[id].solution[nc][randtask] = randres;
+			d_ant[id].makespan[i] = 0;
+		d_ant[id].makespan[randres] = d_job[randtask].res[randres];
+		d_ant[id].solution[randtask] = randres;
 	}
 }
 
@@ -228,13 +230,13 @@ int main(int argc, char *argv[])
 	dim3 blockDim(16, 16, 1);
 	dim3 gridDim((ntask - 1) / 16 + 1, (ntask - 1) / 16 + 1, 1);
 	float *d_pheromone, *d_delta, *d_free, *d_heuristic, *d_probability;
-	ant *d_ant;
+	ant *d_ant,ants;
 	job *d_job;
 	curandState  *state_d;
 	cudaMalloc((void**)&d_pheromone, sizeof(float) * ntask * nres);
 	cudaMalloc((void**)&d_free, sizeof(float) * nres);
 	cudaMalloc((void**)&d_delta, sizeof(float) * ntask * nres);
-	cudaMalloc((void**)&d_ant, sizeof(ant) * MAX_ANTS);
+	cudaMalloc((void**)&d_ant, sizeof(ant));
 	cudaMalloc((void**)&d_job, sizeof(job) * ntask);
 	cudaMalloc((void**)&d_heuristic, sizeof(float) * ntask *nres);
 	cudaMalloc((void**)&state_d, sizeof(state));
@@ -247,10 +249,10 @@ int main(int argc, char *argv[])
 	cudaThreadSynchronize();
 	for (;;)
 	{	//	cout<<randres<<","<<randtask<<endl;
-		firststep <<<(ntask - 1) / 32 + 1, 32 >>>(d_ant, d_job, NC);	
+		firststep <<<(ntask - 1) / 32 + 1, 32 >>>(d_ant, d_job);	
 
 		cudaMemcpy(d_free, freeRes, sizeof(float) * nres, cudaMemcpyHostToDevice);
-		select <<<(ntask - 1) / 32 + 1, 32 >>>(NC, d_pheromone, d_delta, d_heuristic, d_job, d_ant, d_probability, d_free, ntask, state_d);
+		select <<<(ntask - 1) / 32 + 1, 32 >>>(d_pheromone, d_delta, d_heuristic, d_job, d_ant, d_probability, d_free, ntask, state_d);
 
 		cudaMemcpy(freeRes, d_free, sizeof(float) * nres, cudaMemcpyDeviceToHost);
 		max = freeRes[0];
@@ -262,20 +264,26 @@ int main(int argc, char *argv[])
 		//cudaMemcpy(freeRes, d_free, sizeof(float) * nres, cudaMemcpyDeviceToHost);
 		updatePheromone <<< (ntask - 1) / 32 + 1, 32 >>>(d_pheromone, d_delta, d_heuristic, d_job, ntask, max);
 
-		NC += 1;
+		
 		if (NC < MAX_TIME) {
 			emptyTabu <<<(ntask - 1) / 32 + 1, 32 >>>(d_ant, d_delta, ntask);
-			cudaMemcpy(ants, d_ant, sizeof(ant) * MAX_ANTS, cudaMemcpyDeviceToHost);
+		//	cudaMemcpy(ants, d_ant, sizeof(ant) * MAX_ANTS, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(&ants, d_ant, sizeof(ant), cudaMemcpyDeviceToHost); 
+                        
+	                memcpy(allsolution[NC],ants.solution,sizeof(int)*ntask);
+                        memcpy(allmakespan[NC],ants.makespan,sizeof(float)*nres);
+                        NC+=1;
 		}
 		else {
 			break;
 		}
-	}//end of for(;;)
+               
+       }//end of for(;;)
 
 	cudaThreadSynchronize();
 
-	cudaMemcpy(ants, d_ant, sizeof(ant) * MAX_ANTS, cudaMemcpyDeviceToHost);
-	cudaMemcpy(jobs, d_job, sizeof(job) * ntask, cudaMemcpyDeviceToHost);
+	//cudaMemcpy(ants, d_ant, sizeof(ant) * MAX_ANTS, cudaMemcpyDeviceToHost);
+	//cudaMemcpy(jobs, d_job, sizeof(job) * ntask, cudaMemcpyDeviceToHost);
 
 	clock_t end = clock();
 	double time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
@@ -295,13 +303,13 @@ int main(int argc, char *argv[])
 	for (int i = 0; i<MAX_ANTS; i++) {
 		max = 0;
 		for (int y = 0; y<MAX_TIME; y++) {
-			max = ants[i].makespan[y][0];
+			max = allmakespan[y][0];
 			//antindex = i;
 			//spanindex = y;
 			for (int q = 1; q < nres; q++) {
-				printf("span:%f\n",ants[i].makespan[y][q]);
-				if (ants[i].makespan[y][q] > max) {
-					max = ants[i].makespan[y][q];
+				printf("span:%f\n",allmakespan[y][q]);
+				if (allmakespan[y][q] > max) {
+					max = allmakespan[y][q];
 					//antindex = i;
 					//spanindex = y;
 				}
